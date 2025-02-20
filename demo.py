@@ -21,6 +21,7 @@ from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.utils.viz_demo import convert_scene_output_to_glb, get_dynamic_mask_from_pairviewer
 import matplotlib.pyplot as pl
 import cv2
+from PIL import Image
 
 pl.ion()
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
@@ -47,10 +48,13 @@ def get_args_parser():
     parser.add_argument('--use_gt_davis_masks', action='store_true', default=False, help='Use ground truth masks for DAVIS')
     parser.add_argument('--not_batchify', action='store_true', default=False, help='Use non batchify mode for global optimization')
     parser.add_argument('--real_time', action='store_true', default=False, help='Realtime mode')
+    parser.add_argument('--video_annotation', action='store_true', default=False, help='Video annotation mode (get aligned pointmaps)')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for inference')
 
     parser.add_argument('--fps', type=int, default=0, help='FPS for video processing')
-    parser.add_argument('--num_frames', type=int, default=200, help='Maximum number of frames for video processing')
+    parser.add_argument('--num_frames', type=int, default=128, help='Maximum number of frames for video processing')
+
+    parser.add_argument("--mask_sky", action='store_true', default=False, help="mask_sky")
     
     # Add "share" argument if you want to make the demo accessible on the public internet
     parser.add_argument("--share", action='store_true', default=False, help="Share the demo")
@@ -85,6 +89,119 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                                         transparent_cams=transparent_cams, cam_size=cam_size, show_cam=show_cam, silent=silent, save_name=save_name,
                                         cam_color=cam_color)
 
+def get_pointmaps_from_scene(outdir, silent, scene, dynamic_masks, min_conf_thr=3, as_pointcloud=False, mask_sky=False,
+                            clean_depth=False, transparent_cams=False, cam_size=0.05, show_cam=True, save_name=None, thr_for_init_conf=True):
+    """
+    extract 3D_model (glb file) from a reconstructed scene
+    """
+    if scene is None:
+        return None
+    # post processes
+    if clean_depth:
+        scene = scene.clean_pointcloud()
+    if mask_sky:
+        scene = scene.mask_sky()
+
+    # get optimized values from scene
+    rgbimg = scene.imgs
+    focals = scene.get_focals().cpu()
+    cams2world = scene.get_im_poses().cpu()
+    # 3D pointcloud from depthmap, poses and intrinsics
+    point_maps = np.array(to_numpy(scene.get_pts3d(raw_pts=False)))#??????????????
+
+    if save_name is None: 
+        save_name='pointmaps'
+        outfile = os.path.join(outdir, save_name+'.npy')
+    if not silent:
+        print('(exporting pointmaps to', outfile, ')')
+    
+    
+    np.save(outfile, point_maps.astype(np.float16))
+
+    min_vals = np.min(point_maps, axis=(0, 1, 2), keepdims=True)
+    max_vals = np.max(point_maps, axis=(0, 1, 2), keepdims=True)
+    point_maps_normalized = (point_maps - min_vals) / (max_vals - min_vals)
+    
+    # visualization
+    images = []
+    
+    # for i, point_map in enumerate(point_maps):
+    #     # Apply color map to point map
+    #     point_map_colored = cv2.applyColorMap((point_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    #     img_path = f'{outdir}/pointmap_frame_{(i):04d}.png'
+    #     cv2.imwrite(img_path, point_map_colored)
+    #     img = cv2.cvtColor(point_map_colored, cv2.COLOR_BGR2RGB)
+    #     img = Image.fromarray(img)
+    #     images.append(img)
+
+    for i, point_map in enumerate(point_maps_normalized):
+        # Normalize each coordinate (assuming already normalized between 0 and 1)
+        point_map_rgb = (point_map * 255).astype(np.uint8)  # Scale to 0-255 for RGB mapping
+
+        # Convert (H, W, 3) into an RGB image
+        # # save pointmaps per frame
+        # img_path = f'{outdir}/pointmap_frame_{i:04d}.png'
+        # cv2.imwrite(img_path, point_map_rgb)
+
+        # Convert BGR (OpenCV default) to RGB for visualization
+        img = cv2.cvtColor(point_map_rgb, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(img)
+        images.append(img)
+    images[0].save(f'{outdir}/_pointmaps.gif', save_all=True, append_images=images[1:], duration=100, loop=0)
+
+
+    # masked pointmaps
+
+    # Initialize output array with zeros
+    point_maps_masked_normalized = np.zeros_like(point_maps)
+
+    # Extract masked regions for all channels
+    masked_values = point_maps[dynamic_masks]
+
+    if masked_values.size > 0:  # Avoid division by zero if mask is empty
+        min_vals = masked_values.min(axis=0)  # Min per channel
+        max_vals = masked_values.max(axis=0)  # Max per channel
+
+        # Avoid division by zero for constant values
+        valid_range = max_vals > min_vals
+        normalized_values = np.zeros_like(masked_values)
+
+        # Normalize only where valid_range is True
+        normalized_values[:, valid_range] = (masked_values[:, valid_range] - min_vals[valid_range]) / (
+            max_vals[valid_range] - min_vals[valid_range]
+        )
+
+        # Assign back to the masked regions
+        point_maps_masked_normalized[dynamic_masks] = normalized_values
+    
+    np.save(os.path.join(outdir, 'pointmaps_masked_normalized.npy'), point_maps_masked_normalized.astype(np.float16))
+    
+    images = []
+    for i, point_map in enumerate(point_maps_masked_normalized):
+        # Normalize each coordinate (assuming already normalized between 0 and 1)
+        point_map_rgb = (point_map * 255).astype(np.uint8)  # Scale to 0-255 for RGB mapping
+        # Convert (H, W, 3) into an RGB image
+        # img_path = f'{outdir}/pointmap_frame_{i:04d}.png'
+        # cv2.imwrite(img_path, point_map_rgb)
+        # Convert BGR (OpenCV default) to RGB for visualization
+        img = cv2.cvtColor(point_map_rgb, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(img)
+        images.append(img)
+    images[0].save(f'{outdir}/_pointmaps_masked_normalized.gif', save_all=True, append_images=images[1:], duration=100, loop=0)
+
+    
+
+    return outfile
+
+    # scene.min_conf_thr = min_conf_thr
+    # scene.thr_for_init_conf = thr_for_init_conf
+    # msk = to_numpy(scene.get_masks())
+    # cmap = pl.get_cmap('viridis')
+    # cam_color = [cmap(i/len(rgbimg))[:3] for i in range(len(rgbimg))]
+    # cam_color = [(255*c[0], 255*c[1], 255*c[2]) for c in cam_color]
+    # return convert_scene_output_to_glb(outdir, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
+    #                                     transparent_cams=transparent_cams, cam_size=cam_size, show_cam=show_cam, silent=silent, save_name=save_name,
+    #                                     cam_color=cam_color)
 
 def get_reconstructed_scene(args, outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
                             as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, show_cam, scenegraph_type, winsize, refid, 
@@ -130,6 +247,9 @@ def get_reconstructed_scene(args, outdir, model, device, silent, image_size, fil
     os.makedirs(save_folder, exist_ok=True)
     outfile = get_3D_model_from_scene(save_folder, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
                             clean_depth, transparent_cams, cam_size, show_cam)
+    # outfile = get_pointmaps_from_scene(save_folder, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
+    #                         clean_depth, transparent_cams, cam_size, show_cam)
+    
 
     poses = scene.save_tum_poses(f'{save_folder}/pred_traj.txt')
     K = scene.save_intrinsics(f'{save_folder}/pred_intrinsics.txt')
@@ -177,6 +297,102 @@ def get_reconstructed_scene(args, outdir, model, device, silent, image_size, fil
 
     return scene, outfile, imgs
 
+def get_reconstructed_pointmaps(args, outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
+                            as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, show_cam, scenegraph_type, winsize, refid, 
+                            seq_name, new_model_weights, temporal_smoothing_weight, translation_weight, shared_focal, 
+                            flow_loss_weight, flow_loss_start_iter, flow_loss_threshold, use_gt_mask, fps, num_frames):
+    """
+    from a list of images, run dust3r inference, global aligner.
+    then run get_3D_model_from_scene
+    """
+    translation_weight = float(translation_weight)
+    if new_model_weights != args.weights:
+        model = AsymmetricCroCo3DStereo.from_pretrained(new_model_weights).to(device)
+    model.eval()
+    if seq_name != "NULL":
+        dynamic_mask_path = f'data/davis/DAVIS/masked_images/480p/{seq_name}'
+    else:
+        dynamic_mask_path = None
+    imgs = load_images(filelist, size=image_size, verbose=not silent, dynamic_mask_root=dynamic_mask_path, fps=fps, num_frames=num_frames)
+    if len(imgs) == 1:
+        imgs = [imgs[0], copy.deepcopy(imgs[0])]
+        imgs[1]['idx'] = 1
+    if scenegraph_type == "swin" or scenegraph_type == "swinstride" or scenegraph_type == "swin2stride":
+        scenegraph_type = scenegraph_type + "-" + str(winsize) + "-noncyclic"
+    elif scenegraph_type == "oneref":
+        scenegraph_type = scenegraph_type + "-" + str(refid)
+
+    pairs = make_pairs(imgs, scene_graph=scenegraph_type, prefilter=None, symmetrize=True)
+    output = inference(pairs, model, device, batch_size=args.batch_size, verbose=not silent)
+    if len(imgs) > 2:
+        mode = GlobalAlignerMode.PointCloudOptimizer  
+        scene = global_aligner(output, device=device, mode=mode, verbose=not silent, shared_focal = shared_focal, temporal_smoothing_weight=temporal_smoothing_weight, translation_weight=translation_weight,
+                               flow_loss_weight=flow_loss_weight, flow_loss_start_epoch=flow_loss_start_iter, flow_loss_thre=flow_loss_threshold, use_self_mask=not use_gt_mask,
+                               num_total_iter=niter, empty_cache= len(filelist) > 72, batchify=not args.not_batchify)
+    else:
+        mode = GlobalAlignerMode.PairViewer
+        scene = global_aligner(output, device=device, mode=mode, verbose=not silent)
+    lr = 0.01
+
+    if mode == GlobalAlignerMode.PointCloudOptimizer:
+        loss = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=lr)
+
+    save_folder = f'{args.output_dir}/{seq_name}'  #default is 'demo_tmp/NULL'
+    os.makedirs(save_folder, exist_ok=True)
+
+    # outfile = get_3D_model_from_scene(save_folder, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
+    #                         clean_depth, transparent_cams, cam_size, show_cam)
+
+    poses = scene.save_tum_poses(f'{save_folder}/pred_traj.txt')
+    K = scene.save_intrinsics(f'{save_folder}/pred_intrinsics.txt')
+    depth_maps = scene.save_depth_maps_minimal(save_folder)
+    # dynamic_masks = scene.save_dynamic_masks(save_folder)
+    # conf = scene.save_conf_maps(save_folder)
+    # init_conf = scene.save_init_conf_maps(save_folder)
+    # rgbs = scene.save_rgb_imgs(save_folder)
+    # enlarge_seg_masks(save_folder, kernel_size=5 if use_gt_mask else 3) 
+    dynamic_masks = scene.save_dynamic_masks(save_folder)
+    # dynamic_masks_enlarged = scene.save_dynamic_masks_enlarged(save_folder, kernel_size=5 if use_gt_mask else 3)
+
+    outfile = get_pointmaps_from_scene(save_folder, silent, scene, dynamic_masks, min_conf_thr, as_pointcloud, mask_sky,
+                            clean_depth, transparent_cams, cam_size, show_cam)
+
+    # # also return rgb, depth and confidence imgs
+    # # depth is normalized with the max value for all images
+    # # we apply the jet colormap on the confidence maps
+    # rgbimg = scene.imgs
+    # depths = to_numpy(scene.get_depthmaps())
+    # confs = to_numpy([c for c in scene.im_conf])
+    # init_confs = to_numpy([c for c in scene.init_conf_maps])
+    # cmap = pl.get_cmap('jet')
+    # depths_max = max([d.max() for d in depths])
+    # depths = [cmap(d/depths_max) for d in depths]
+    # confs_max = max([d.max() for d in confs])
+    # confs = [cmap(d/confs_max) for d in confs]
+    # init_confs_max = max([d.max() for d in init_confs])
+    # init_confs = [cmap(d/init_confs_max) for d in init_confs]
+
+    # imgs = []
+    # for i in range(len(rgbimg)):
+    #     imgs.append(rgbimg[i])
+    #     imgs.append(rgb(depths[i]))
+    #     imgs.append(rgb(confs[i]))
+    #     imgs.append(rgb(init_confs[i]))
+
+    # # if two images, and the shape is same, we can compute the dynamic mask
+    # if len(rgbimg) == 2 and rgbimg[0].shape == rgbimg[1].shape:
+    #     motion_mask_thre = 0.35
+    #     error_map = get_dynamic_mask_from_pairviewer(scene, both_directions=True, output_dir=args.output_dir, motion_mask_thre=motion_mask_thre)
+    #     # imgs.append(rgb(error_map))
+    #     # apply threshold on the error map
+    #     normalized_error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
+    #     error_map_max = normalized_error_map.max()
+    #     error_map = cmap(normalized_error_map/error_map_max)
+    #     imgs.append(rgb(error_map))
+    #     binary_error_map = (normalized_error_map > motion_mask_thre).astype(np.uint8)
+    #     imgs.append(rgb(binary_error_map*255))
+
+    return scene, outfile
 
 def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
     # if inputfiles[0] is a video, set the num_files to 200
@@ -393,6 +609,36 @@ if __name__ == '__main__':
                 scenegraph_type='oneref_mid',
                 refid=0,
                 seq_name=args.seq_name,
+                fps=args.fps,
+                num_frames=args.num_frames,
+            )
+        elif args.video_annotation:
+            recon_fun = functools.partial(get_reconstructed_pointmaps, args, tmpdirname, model, args.device, args.silent, args.image_size)
+            # Call the function with default parameters
+            scene, outfile = recon_fun(
+                filelist=input_files,
+                schedule='linear',
+                niter=300,
+                min_conf_thr=1.1,
+                as_pointcloud=True,
+                mask_sky=args.mask_sky,
+                clean_depth=True,
+                transparent_cams=False,
+                cam_size=0.05,
+                show_cam=True,
+                scenegraph_type='swinstride',
+                winsize=5,
+                refid=0,
+                seq_name=args.seq_name,
+                new_model_weights=args.weights,
+                temporal_smoothing_weight=0.01,
+                translation_weight='1.0',
+                shared_focal=True,
+                flow_loss_weight=0.01,
+                # flow_loss_weight=0.0, # faster inference, worse performance, no dynamic map
+                flow_loss_start_iter=0.1,
+                flow_loss_threshold=25,
+                use_gt_mask=args.use_gt_davis_masks,
                 fps=args.fps,
                 num_frames=args.num_frames,
             )

@@ -15,6 +15,9 @@ def convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, c
                                  transparent_cams=False, silent=False, save_name=None):
     assert len(pts3d) == len(mask) <= len(imgs) <= len(cams2world) == len(focals)
     pts3d = to_numpy(pts3d)
+    ###### tx
+    
+    ###### tx
     imgs = to_numpy(imgs)
     focals = to_numpy(focals)
     cams2world = to_numpy(cams2world)

@@ -347,9 +347,29 @@ class BasePCOptimizer (nn.Module):
 
     def save_dynamic_masks(self, path):
         dynamic_masks = self.dynamic_masks if getattr(self, 'sam2_dynamic_masks', None) is None else self.sam2_dynamic_masks
-        for i, dynamic_mask in enumerate(dynamic_masks):
-            cv2.imwrite(f'{path}/dynamic_mask_{i}.png', (dynamic_mask * 255).detach().cpu().numpy().astype(np.uint8))
+        # for i, dynamic_mask in enumerate(dynamic_masks):
+        #     cv2.imwrite(f'{path}/dynamic_mask_{i}.png', (dynamic_mask * 255).detach().cpu().numpy().astype(np.uint8))
+        dynamic_masks = torch.stack(dynamic_masks).detach().cpu().numpy()
+        dynamic_masks = np.array(dynamic_masks).astype(bool)
+        np.save(f'{path}/dynamic_masks.npy', dynamic_masks)
         return dynamic_masks
+    
+    def save_dynamic_masks_enlarged(self, path, kernel_size=5):
+        dynamic_masks = self.dynamic_masks if getattr(self, 'sam2_dynamic_masks', None) is None else self.sam2_dynamic_masks
+        dynamic_masks = torch.stack(dynamic_masks).detach().cpu().numpy()
+
+        # enlarge the mask
+        dynamic_masks_enlarged = []
+        kernel = np.ones((kernel_size, kernel_size),np.uint8)
+        for i, mask in enumerate(dynamic_masks):
+            enlarged_mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
+            # cv2.imwrite(f'{path}/dynamic_mask_enlarged_{i}.png', (enlarged_mask * 255).astype(np.uint8)) # save mask per frame
+            dynamic_masks_enlarged.append(enlarged_mask)
+        dynamic_masks_enlarged = np.array(dynamic_masks_enlarged).astype(bool)
+
+        np.save(f'{path}/dynamic_mask_enlarged.npy', dynamic_masks_enlarged)
+
+        return dynamic_masks_enlarged
 
     def save_depth_maps(self, path):
         depth_maps = self.get_depthmaps()
@@ -362,6 +382,27 @@ class BasePCOptimizer (nn.Module):
             cv2.imwrite(img_path, depth_map_colored)
             images.append(Image.open(img_path))
             np.save(f'{path}/frame_{(i):04d}.npy', depth_map.detach().cpu().numpy())
+        
+        images[0].save(f'{path}/_depth_maps.gif', save_all=True, append_images=images[1:], duration=100, loop=0)
+        
+        return depth_maps
+
+    def save_depth_maps_minimal(self, path):
+        depth_maps = torch.stack(self.get_depthmaps()).detach().cpu().numpy()
+        images = []
+
+        np.save(f'{path}/depth_maps.npy', depth_maps.astype(np.float16))
+
+        normalized_depth_maps = depth_maps / depth_maps.max()
+        
+        for i, depth_map in enumerate(normalized_depth_maps):
+            # Apply color map to depth map
+            depth_map_colored = cv2.applyColorMap((depth_map*255).astype(np.uint8), cv2.COLORMAP_MAGMA)
+            # img_path = f'{path}/frame_{(i):04d}.png'
+            # cv2.imwrite(img_path, depth_map_colored)
+            # images.append(Image.open(img_path))
+            images.append(Image.fromarray(cv2.cvtColor(depth_map_colored, cv2.COLOR_BGR2RGB)))
+            # np.save(f'{path}/frame_{(i):04d}.npy', depth_map.detach().cpu().numpy())
         
         images[0].save(f'{path}/_depth_maps.gif', save_all=True, append_images=images[1:], duration=100, loop=0)
         
